@@ -65,24 +65,31 @@ jobs:
 
       - name: Create deployment tracking issue
         id: create_issue
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          COMMIT_SHA: ${{ github.sha }}
+          PREV_COMMIT: ${{ steps.previous_commit.outputs.sha }}
+          PACKAGE_VERSION: ${{ steps.package_version.outputs.version }}
+          ACTOR: ${{ github.actor }}
         uses: actions/github-script@v7
         with:
           script: |
-            const commitSha = context.sha.substring(0, 7);
+            const commitSha = process.env.COMMIT_SHA.substring(0, 7);
             const issueTitle = `Deployment Tracking - ${commitSha}`;
             
             const issue = await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: process.env.OWNER,
+              repo: process.env.REPO,
               title: issueTitle,
               labels: ['deployment', 'in-progress'],
               body: `# Deployment Tracking
 
-            **Commit SHA:** \`${context.sha}\`
-            **Previous Commit:** \`${{ steps.previous_commit.outputs.sha }}\`
-            **Package Version:** \`${{ steps.package_version.outputs.version }}\`
+            **Commit SHA:** \`${process.env.COMMIT_SHA}\`
+            **Previous Commit:** \`${process.env.PREV_COMMIT}\`
+            **Package Version:** \`${process.env.PACKAGE_VERSION}\`
             **Triggered at:** ${new Date().toISOString()}
-            **Triggered by:** ${context.actor}
+            **Triggered by:** ${process.env.ACTOR}
 
             ## Workflow Status
             - [ ] Pre-deployment checks
@@ -95,27 +102,28 @@ jobs:
             });
             
             core.setOutput('issue_number', issue.data.number);
-            core.setOutput('issue_created', 'true');
+            core.exportVariable('DEPLOY_ISSUE_NUMBER', issue.data.number);
 
       - name: Post pre-deployment completion comment
+        env:
+          ISSUE_NUMBER: ${{ steps.create_issue.outputs.issue_number }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
         uses: actions/github-script@v7
         with:
           script: |
-            const issueNumber = core.getInput('issue_number');
             await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: parseInt(issueNumber),
+              owner: process.env.OWNER,
+              repo: process.env.REPO,
+              issue_number: parseInt(process.env.ISSUE_NUMBER),
               body: `## ✅ Pre-deployment checks completed
 
             All quality checks (lint and tests) have been successfully passed.
 
-            **Deployment Issue:** [#${process.env.ISSUE_NUMBER}](${context.repo.owner}/${context.repo.repo}/issues/${process.env.ISSUE_NUMBER})
+            **Deployment Issue:** [#${process.env.ISSUE_NUMBER}](${process.env.OWNER}/${process.env.REPO}/issues/${process.env.ISSUE_NUMBER})
 
             ---`
             });
-            
-            core.exportVariable('ISSUE_NUMBER', issueNumber);
 
   rollback-preparation:
     name: rollback-preparation
@@ -123,7 +131,7 @@ jobs:
     needs: pre-deployment
     outputs:
       artifact_name: ${{ steps.create_artifact.outputs.artifact_name }}
-      issue_number: ${{ steps.save_issue_number.outputs.issue_number }}
+      issue_number: ${{ steps.gather_issue.outputs.issue_number }}
       checksum_value: ${{ steps.create_checksum.outputs.checksum_value }}
     steps:
       - name: Checkout repository
@@ -139,10 +147,6 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
-
-      - name: Export issue number for later use
-        id: save_issue_number
-        run: echo "issue_number=${{ needs.pre-deployment.outputs.issue_number }}" >> $GITHUB_OUTPUT
 
       - name: Create rollback script
         run: |
@@ -458,11 +462,7 @@ jobs:
       - name: Update SHA256 checksum file
         id: create_checksum
         run: |
-          COMMIT_SHORT=$(echo "${{ needs.pre-deployment.outputs.current_commit }}" | cut -c1-7)
-          ARTIFACT_NAME="rollback-package-${COMMIT_SHORT}"
-          CHECKSUM_FILE="${ARTIFACT_NAME}.tar.gz.sha256"
-          
-          # Add checksum value to artifact name for easier reference
+          ARTIFACT_NAME="${{ steps.create_artifact.outputs.artifact_name }}"
           echo "checksum_value=${{ steps.create_artifact.outputs.checksum_value }}" >> $GITHUB_OUTPUT
 
       - name: Upload rollback artifacts
@@ -479,16 +479,27 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+      - name: Gather issue number from dependency
+        id: gather_issue
+        run: echo "issue_number=${{ needs.pre-deployment.outputs.issue_number }}" >> $GITHUB_OUTPUT
+
       - name: Update deployment issue with rollback comment
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          ISSUE_NUMBER: ${{ steps.gather_issue.outputs.issue_number }}
+          CURRENT_SHA: ${{ needs.pre-deployment.outputs.current_commit }}
+          PREV_SHA: ${{ needs.pre-deployment.outputs.previous_commit }}
+          PACKAGE_VERSION: ${{ needs.pre-deployment.outputs.package_version }}
+          ARTIFACT_NAME: ${{ steps.create_artifact.outputs.artifact_name }}
+          CHECKSUM_VALUE: ${{ steps.create_artifact.outputs.checksum_value }}
         uses: actions/github-script@v7
         with:
           script: |
-            const prevPr = process.env.ISSUE_NUMBER;
-            const currentSha = "${{ needs.pre-deployment.outputs.current_commit }}".substring(0, 7);
-            const prevSha = "${{ needs.pre-deployment.outputs.previous_commit }}".substring(0, 7);
-            const packageVersion = "${{ needs.pre-deployment.outputs.package_version }}";
-            const artifactName = "${{ steps.create_artifact.outputs.artifact_name }}";
-            const checksumValue = "${{ steps.create_artifact.outputs.checksum_value }}";
+            const currentSha = process.env.CURRENT_SHA.substring(0, 7);
+            const prevSha = process.env.PREV_SHA.substring(0, 7);
+            const artifactName = process.env.ARTIFACT_NAME;
+            const checksumValue = process.env.CHECKSUM_VALUE;
             
             const commentBody = `## 🔄 Rollback Plan Ready
 
@@ -497,7 +508,7 @@ jobs:
             |-------|-------|
             | **Previous Commit** | \`${prevSha}\` |
             | **Current Commit** | \`${currentSha}\` |
-            | **Package Version** | \`${packageVersion}\` |
+            | **Package Version** | \`${process.env.PACKAGE_VERSION}\` |
             | **Artifact Name** | \`${artifactName}\` |
             | **SHA256** | \`${checksumValue}\` |
 
@@ -529,9 +540,9 @@ jobs:
             *This comment was automatically generated by the deployment workflow.*`;
 
             await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: parseInt(prevPr),
+              owner: process.env.OWNER,
+              repo: process.env.REPO,
+              issue_number: parseInt(process.env.ISSUE_NUMBER),
               body: commentBody
             });
 
@@ -546,15 +557,19 @@ jobs:
           fetch-depth: 0
 
       - name: Update issue labels and status
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          ISSUE_NUMBER: ${{ needs.rollback-preparation.outputs.issue_number }}
         uses: actions/github-script@v7
         with:
           script: |
-            const issueNumber = "${{ needs.rollback-preparation.outputs.issue_number }}";
+            const issueNumber = process.env.ISSUE_NUMBER;
             
             // First, get the issue
             const issue = await github.rest.issues.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: process.env.OWNER,
+              repo: process.env.REPO,
               issue_number: parseInt(issueNumber)
             });
             
@@ -572,23 +587,30 @@ jobs:
             
             // Update the issue
             await github.rest.issues.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: process.env.OWNER,
+              repo: process.env.REPO,
               issue_number: parseInt(issueNumber),
               labels: labels
             });
             
-            core.exportVariable('ISSUE_NUMBER', issueNumber);
+            core.exportVariable('DEPLOY_ISSUE_NUMBER', issueNumber);
 
       - name: Post deployment completion comment
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          ISSUE_NUMBER: ${{ needs.rollback-preparation.outputs.issue_number }}
+          ARTIFACT_NAME: ${{ needs.rollback-preparation.outputs.artifact_name }}
+          CURRENT_SHA: ${{ needs.pre-deployment.outputs.current_commit }}
+          PACKAGE_VERSION: ${{ needs.pre-deployment.outputs.package_version }}
+          CHECKSUM_VALUE: ${{ needs.rollback-preparation.outputs.checksum_value }}
         uses: actions/github-script@v7
         with:
           script: |
             const issueNumber = process.env.ISSUE_NUMBER;
-            const artifactName = "${{ needs.rollback-preparation.outputs.artifact_name }}";
-            const currentSha = "${{ needs.pre-deployment.outputs.current_commit }}".substring(0, 7);
-            const packageVersion = "${{ needs.pre-deployment.outputs.package_version }}";
-            const checksumValue = "${{ needs.rollback-preparation.outputs.checksum_value }}";
+            const currentSha = process.env.CURRENT_SHA.substring(0, 7);
+            const artifactName = process.env.ARTIFACT_NAME;
+            const checksumValue = process.env.CHECKSUM_VALUE;
             
             const commentBody = `## ✅ Deployment Completed Successfully
 
@@ -596,14 +618,14 @@ jobs:
             | Field | Value |
             |-------|-------|
             | **Commit SHA** | \`${currentSha}\` |
-            | **Package Version** | \`${packageVersion}\` |
+            | **Package Version** | \`${process.env.PACKAGE_VERSION}\` |
             | **Artifact Name** | \`${artifactName}\` |
             | **SHA256 Checksum** | \`${checksumValue}\` |
             | **Status** | ✅ Completed |
 
             ### Rollback Details
-            - **Previous Commit**: \`${{ needs.pre-deployment.outputs.previous_commit }}\`
-            - **Rollback Artifact**: [Download](${context.repo.owner}/${context.repo.repo}/actions/artifacts)
+            - **Previous Commit**: \`${process.env.PREV_SHA}\`
+            - **Rollback Artifact**: [Download](${process.env.OWNER}/${process.env.REPO}/actions/artifacts)
             - **SHA256 Checksum**: \`${checksumValue}\`
 
             ### Verification Checklist
@@ -630,21 +652,23 @@ jobs:
             *This comment was automatically generated by the deployment workflow.*`;
 
             await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: process.env.OWNER,
+              repo: process.env.REPO,
               issue_number: parseInt(issueNumber),
               body: commentBody
             });
 
       - name: Close deployment tracking issue
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          ISSUE_NUMBER: ${{ needs.rollback-preparation.outputs.issue_number }}
         uses: actions/github-script@v7
         with:
           script: |
-            const issueNumber = process.env.ISSUE_NUMBER;
-            
             await github.rest.issues.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: parseInt(issueNumber),
+              owner: process.env.OWNER,
+              repo: process.env.REPO,
+              issue_number: parseInt(process.env.ISSUE_NUMBER),
               state: 'closed'
             });
