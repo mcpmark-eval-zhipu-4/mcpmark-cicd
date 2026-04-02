@@ -123,6 +123,7 @@ jobs:
     needs: pre-deployment
     outputs:
       artifact_name: ${{ steps.create_artifact.outputs.artifact_name }}
+      issue_number: ${{ steps.save_issue_number.outputs.issue_number }}
       checksum_value: ${{ steps.create_checksum.outputs.checksum_value }}
     steps:
       - name: Checkout repository
@@ -138,6 +139,10 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Export issue number for later use
+        id: save_issue_number
+        run: echo "issue_number=${{ needs.pre-deployment.outputs.issue_number }}" >> $GITHUB_OUTPUT
 
       - name: Create rollback script
         run: |
@@ -287,6 +292,12 @@ jobs:
 
           chmod +x rollback.sh
           echo "Rollback script created successfully"
+          echo "Previous commit: ${{ steps.previous_commit.outputs.sha }}"
+          echo "Current commit: ${{ steps.current_commit.outputs.sha }}"
+          echo "Package version: ${{ steps.package_version.outputs.version }}"
+          echo "DEPLOY_PREVIOUS_COMMIT=${{ steps.previous_commit.outputs.sha }}" >> $GITHUB_ENV
+          echo "DEPLOY_CURRENT_COMMIT=${{ steps.current_commit.outputs.sha }}" >> $GITHUB_ENV
+          echo "DEPLOY_PACKAGE_VERSION=${{ steps.package_version.outputs.version }}" >> $GITHUB_ENV
 
       - name: Create configuration backups
         run: |
@@ -445,13 +456,13 @@ jobs:
           cat "${ARTIFACT_NAME}.tar.gz.sha256"
 
       - name: Update SHA256 checksum file
+        id: create_checksum
         run: |
           COMMIT_SHORT=$(echo "${{ needs.pre-deployment.outputs.current_commit }}" | cut -c1-7)
           ARTIFACT_NAME="rollback-package-${COMMIT_SHORT}"
           CHECKSUM_FILE="${ARTIFACT_NAME}.tar.gz.sha256"
           
           # Add checksum value to artifact name for easier reference
-          echo "${{ steps.create_artifact.outputs.checksum_value }}  ${ARTIFACT_NAME}.tar.gz" > checksums.txt
           echo "checksum_value=${{ steps.create_artifact.outputs.checksum_value }}" >> $GITHUB_OUTPUT
 
       - name: Upload rollback artifacts
@@ -472,9 +483,9 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const issueNumber = process.env.ISSUE_NUMBER;
+            const prevPr = process.env.ISSUE_NUMBER;
             const currentSha = "${{ needs.pre-deployment.outputs.current_commit }}".substring(0, 7);
-            const previousSha = "${{ needs.pre-deployment.outputs.previous_commit }}".substring(0, 7);
+            const prevSha = "${{ needs.pre-deployment.outputs.previous_commit }}".substring(0, 7);
             const packageVersion = "${{ needs.pre-deployment.outputs.package_version }}";
             const artifactName = "${{ steps.create_artifact.outputs.artifact_name }}";
             const checksumValue = "${{ steps.create_artifact.outputs.checksum_value }}";
@@ -484,7 +495,7 @@ jobs:
             ### Deployment Information
             | Field | Value |
             |-------|-------|
-            | **Previous Commit** | \`${previousSha}\` |
+            | **Previous Commit** | \`${prevSha}\` |
             | **Current Commit** | \`${currentSha}\` |
             | **Package Version** | \`${packageVersion}\` |
             | **Artifact Name** | \`${artifactName}\` |
@@ -520,14 +531,14 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: parseInt(issueNumber),
+              issue_number: parseInt(prevPr),
               body: commentBody
             });
 
   post-deployment:
     name: post-deployment
     runs-on: ubuntu-latest
-    needs: rollback-preparation
+    needs: [pre-deployment, rollback-preparation]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -535,51 +546,49 @@ jobs:
           fetch-depth: 0
 
       - name: Update issue labels and status
-        env:
-          ISSUE_NUMBER: ${{ needs.rollbacks.outputs.issue_number }}
         uses: actions/github-script@v7
         with:
           script: |
+            const issueNumber = "${{ needs.rollback-preparation.outputs.issue_number }}";
+            
             // First, get the issue
             const issue = await github.rest.issues.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: parseInt(process.env.ISSUE_NUMBER)
+              issue_number: parseInt(issueNumber)
             });
             
-            // Remove 'in-progress' label
-            const labels = issue.data.labels.map(label => label.name);
-            const filteredLabels = labels.filter(l => l !== 'in-progress');
+            // Remove 'in-progress' label if present, keep 'deployment'
+            let labels = issue.data.labels.map(label => label.name);
+            labels = labels.filter(l => l !== 'in-progress');
             
-            // Remove previous 'deployment' label if exists and add if not
-            const deploymentIndex = filteredLabels.indexOf('deployment');
-            if (deploymentIndex > -1) {
-              filteredLabels.splice(deploymentIndex, 1);
+            // Ensure 'deployment' and 'completed' labels are present
+            if (!labels.includes('completed')) {
+              labels.push('completed');
             }
-            
-            // Add 'completed' label
-            filteredLabels.push('deployment', 'completed');
+            if (!labels.includes('deployment')) {
+              labels.push('deployment');
+            }
             
             // Update the issue
             await github.rest.issues.update({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: parseInt(process.env.ISSUE_NUMBER),
-              labels: filteredLabels,
-              state: 'open' // Keep issue open for reference
+              issue_number: parseInt(issueNumber),
+              labels: labels
             });
             
-            core.exportVariable('ISSUE_NUMBER', process.env.ISSUE_NUMBER);
+            core.exportVariable('ISSUE_NUMBER', issueNumber);
 
       - name: Post deployment completion comment
-        env:
-          ISSUE_NUMBER: ${{ needs.post-deployment-seq.outputs.issue_number }}
         uses: actions/github-script@v7
         with:
           script: |
+            const issueNumber = process.env.ISSUE_NUMBER;
             const artifactName = "${{ needs.rollback-preparation.outputs.artifact_name }}";
             const currentSha = "${{ needs.pre-deployment.outputs.current_commit }}".substring(0, 7);
             const packageVersion = "${{ needs.pre-deployment.outputs.package_version }}";
+            const checksumValue = "${{ needs.rollback-preparation.outputs.checksum_value }}";
             
             const commentBody = `## ✅ Deployment Completed Successfully
 
@@ -589,35 +598,53 @@ jobs:
             | **Commit SHA** | \`${currentSha}\` |
             | **Package Version** | \`${packageVersion}\` |
             | **Artifact Name** | \`${artifactName}\` |
+            | **SHA256 Checksum** | \`${checksumValue}\` |
             | **Status** | ✅ Completed |
 
             ### Rollback Details
             - **Previous Commit**: \`${{ needs.pre-deployment.outputs.previous_commit }}\`
             - **Rollback Artifact**: [Download](${context.repo.owner}/${context.repo.repo}/actions/artifacts)
-            - **Checksum**: \`${{ needs.rollback-preparation.outputs.checksum_value }}\`
+            - **SHA256 Checksum**: \`${checksumValue}\`
 
             ### Verification Checklist
             - [x] Pre-deployment checks passed
             - [x] Rollback artifacts prepared
             - [x] Configuration backups created
             - [x] Documentation generated
-            - [x] All labels updated
+            - [x] All labels updated: in-progress → completed
 
             ### Next Steps
             - Monitor the deployed application
             - Verify all endpoints are responding correctly
             - Check logs for any errors
             - If issues are detected, use the rollback artifacts to restore the previous version
+            - The deployment tracking issue remains open for reference
+
+            ### Artifact Information
+            | Artifact | Retention | Checksum |
+            |----------|-----------|----------|
+            | \`${artifactName}.tar.gz\` | 30 days | \`${checksumValue}\` |
 
             ---
-
-            This issue will remain open for reference. All deployment artifacts are available in GitHub Actions for 30 days.
 
             *This comment was automatically generated by the deployment workflow.*`;
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: parseInt(process.env.ISSUE_NUMBER),
+              issue_number: parseInt(issueNumber),
               body: commentBody
+            });
+
+      - name: Close deployment tracking issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = process.env.ISSUE_NUMBER;
+            
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: parseInt(issueNumber),
+              state: 'closed'
             });
