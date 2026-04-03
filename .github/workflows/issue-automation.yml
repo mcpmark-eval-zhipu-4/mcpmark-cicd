@@ -7,310 +7,582 @@ on:
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+permissions:
+  contents: write
+  issues: write
+  labels: write
+
 jobs:
   issue-triage:
-    name: Issue Triage
+    name: Issue Classification and Triage
     runs-on: ubuntu-latest
-    if: github.event.action == 'opened' || github.event.action == 'labeled'
+    if: github.event.issue.state == 'open'
     outputs:
-      category_labels: ${{ steps.category.outputs.labels }}
-      priority_label: ${{ steps.priority.outputs.priority }}
+      category_label: ${{ steps.classify-issue.outputs.category }}
+      priority_label: ${{ steps.classify-issue.outputs.priority }}
+      has_bug: ${{ steps.classify-issue.outputs.has_bug }}
+      has_epic: ${{ steps.classify-issue.outputs.has_epic }}
+      has_maintenance: ${{ steps.classify-issue.outputs.has_maintenance }}
+    
     steps:
-      - name: Auto-assign category labels
-        id: category
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Classify and Label Issue
+        id: classify-issue
+        run: |
+          echo "Issue Title: ${{ github.event.issue.title }}"
+          echo "Issue Body: ${{ github.event.issue.body || '' }}"
+          echo "Current Labels: ${{ github.event.issue.labels.map(.name).join(', ') }}"
+          
+          # Determine category labels
+          CATEGORY_LABELS=""
+          CATEGORY_KEYWORDS="${{ github.event.issue.title }}"
+          if [[ "${CATEGORY_KEYWORDS}" == *bug* ]] || [[ "${CATEGORY_KEYWORDS}" == *Bug* ]] || [[ "${CATEGORY_KEYWORDS}" == *BUG* ]]; then
+            CATEGORY_LABELS="bug"
+          fi
+          if [[ "${CATEGORY_KEYWORDS}" == *epic* ]] || [[ "${CATEGORY_KEYWORDS}" == *Epic* ]] || [[ "${CATEGORY_KEYWORDS}" == *EPIC* ]]; then
+            CATEGORY_LABELS="epic"
+          fi
+          if [[ "${CATEGORY_KEYWORDS}" == *maintenance* ]] || [[ "${CATEGORY_KEYWORDS}" == *Maintenance* ]] || [[ "${CATEGORY_KEYWORDS}" == *MAINTENANCE* ]]; then
+            CATEGORY_LABELS="maintenance"
+          fi
+          
+          echo "category=${CATEGORY_LABELS}" >> $GITHUB_OUTPUT
+          echo "has_bug=0" >> $GITHUB_OUTPUT
+          echo "has_epic=0" >> $GITHUB_OUTPUT
+          echo "has_maintenance=0" >> $GITHUB_OUTPUT
+          
+          if [[ "${CATEGORY_LABELS}" == *"bug"* ]]; then
+            echo "has_bug=1" >> $GITHUB_OUTPUT
+          fi
+          if [[ "${CATEGORY_LABELS}" == *"epic"* ]]; then
+            echo "has_epic=1" >> $GITHUB_OUTPUT
+          fi
+          if [[ "${CATEGORY_LABELS}" == *"maintenance"* ]]; then
+            echo "has_maintenance=1" >> $GITHUB_OUTPUT
+          fi
+          
+          # Determine priority labels (check title and body, highest priority wins)
+          ISSUE_CONTENT="${{ github.event.issue.title }}${{ github.event.issue.body || '' }}"
+          PRIORITY_LABELS=""
+          
+          if [[ "${ISSUE_CONTENT}" == *[Cc]ritical* ]] || \
+             [[ "${ISSUE_CONTENT}" == *[Uu]rgent* ]] || \
+             [[ "${ISSUE_CONTENT}" == *[Pp]roduction* ]] || \
+             [[ "${ISSUE_CONTENT}" == *[Oo]utage* ]]; then
+            PRIORITY_LABELS="priority-critical"
+          elif [[ "${ISSUE_CONTENT}" == *[Ii]mportant* ]] || \
+               [[ "${ISSUE_CONTENT}" == *[Hh]igh* ]] || \
+               [[ "${ISSUE_CONTENT}" == *[Bb]locking* ]]; then
+            PRIORITY_LABELS="priority-high"
+          elif [[ "${ISSUE_CONTENT}" == *[Mm]edium* ]] || \
+               [[ "${ISSUE_CONTENT}" == *[Nn]ormal* ]]; then
+            PRIORITY_LABELS="priority-medium"
+          else
+            # Default to medium if no priority keywords found
+            PRIORITY_LABELS="priority-medium"
+          fi
+          
+          echo "priority=${PRIORITY_LABELS}" >> $GITHUB_OUTPUT
+          
+          echo "=== Classification Results ==="
+          echo "Category Labels: ${CATEGORY_LABELS}"
+          echo "Priority Label: ${PRIORITY_LABELS}"
+          echo "Has Bug: ${has_bug}"
+          echo "Has Epic: ${has_epic}"
+          echo "Has Maintenance: ${has_maintenance}"
+
+      - name: Add needs-triage label (default)
+        if: steps.classify-issue.outputs.category == ''
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const issueContext = context.issue;
-            const title = context.payload.issue.title.toLowerCase();
-            let categoryLabels = [];
-            
-            // Check for category keywords in TITLE only (case-insensitive per requirement)
-            if (title.includes('bug')) {
-              categoryLabels.push('bug');
-            }
-            if (title.includes('epic')) {
-              categoryLabels.push('epic');
-            }
-            if (title.includes('maintenance')) {
-              categoryLabels.push('maintenance');
-            }
-            
-            // Default: enhancement if no category found
-            if (categoryLabels.length === 0) {
-              categoryLabels.push('enhancement');
-            }
-            
-            // Always add needs-triage label for new issues
-            categoryLabels.push('needs-triage');
-            
-            // Assign labels
-            if (categoryLabels.length > 0) {
-              await github.rest.issues.addLabels({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issueContext.number,
-                labels: categoryLabels
-              });
-              console.log('Added category labels:', categoryLabels.join(', '));
-            }
-            
-            core.setOutput('labels', categoryLabels.join(','));
-            
-      - name: Determine priority label
-        id: priority
+            github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['needs-triage']
+            })
+
+      - name: Add Category and Priority Labels
+        if: steps.classify-issue.outputs.category != '' || steps.classify-issue.outputs.priority != ''
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const issueContext = context.issue;
-            const title = context.payload.issue.title.toLowerCase();
-            const body = (context.payload.issue.body || '').toLowerCase();
-            let priorityLabel = 'priority-medium';
+            const requestedLabels = [];
             
-            // Priority keywords (highest priority wins) - check both title and body
-            const priorityKeywords = [
-              { label: 'priority-critical', keywords: ['critical', 'urgent', 'production', 'outage'] },
-              { label: 'priority-high', keywords: ['important', 'high', 'blocking'] },
-              { label: 'priority-medium', keywords: ['medium', 'normal'] },
-              { label: 'priority-low', keywords: ['low', 'nice-to-have', 'minor'] }
-            ];
+            // Add needs-triage if not already present
+            if (context.issue.labels.length > 0) {
+              const existingLabels = context.issue.labels.map(l => l.name);
+              if (!existingLabels.includes('needs-triage')) {
+                requestedLabels.push('needs-triage');
+              }
+            } else {
+              requestedLabels.push('needs-triage');
+            }
             
-            // Check title first, then body for priority
-            for (const priority of priorityKeywords) {
-              if (priority.label === 'priority-high') {
-                for (const keyword of priority.keywords) {
-                  if (title.includes(keyword) || body.includes(keyword)) {
-                    priorityLabel = priority.label;
-                    console.log('Detected priority:', priorityLabel);
-                    break;
-                  }
-                }
-                if (priorityLabel === 'priority-high') break;
+            // Add category labels
+            if ('${{ steps.classify-issue.outputs.category }}') {
+              const category = '${{ steps.classify-issue.outputs.category }}';
+              if (!requestedLabels.includes(category) && !context.issue.labels.find(l => l.name === category)) {
+                requestedLabels.push(category);
               }
             }
             
-            // Get current labels
-            const currentIssue = await github.rest.issues.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issueContext.number
-            });
-            
-            const priorityLabels = ['priority-critical', 'priority-high', 'priority-medium', 'priority-low'];
-            const currentLabels = currentIssue.data.labels.map(l => l.name);
-            const targetLabels = currentLabels.filter(l => !priorityLabels.includes(l));
-            
-            if (!targetLabels.includes(priorityLabel)) {
-              targetLabels.push(priorityLabel);
-              await github.rest.issues.setLabels({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issueContext.number,
-                labels: targetLabels
-              });
-              console.log('Updated priority label to:', priorityLabel);
+            // Add priority labels
+            if ('${{ steps.classify-issue.outputs.priority }}') {
+              const priority = '${{ steps.classify-issue.outputs.priority }}';
+              if (!requestedLabels.includes(priority) && !context.issue.labels.find(l => l.name === priority)) {
+                requestedLabels.push(priority);
+              }
             }
             
-            core.setOutput('priority', priorityLabel)
+            console.log('Adding labels:', requestedLabels);
+            
+            if (requestedLabels.length > 0) {
+              await github.rest.issues.addLabels({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                labels: requestedLabels
+              });
+            }
 
   task-breakdown:
-    name: Task Breakdown
+    name: Break Down Epic Issues
     runs-on: ubuntu-latest
     needs: issue-triage
-    if: startsWith(github.event.issue.title, 'Epic')
+    if: needs.issue-triage.outputs.has_epic == '1' && github.event.issue.state == 'open'
+    outputs:
+      sub_issues: ${{ steps.create-sub-issues.outputs.sub_issues }}
+    
     steps:
-      - name: Create sub-issues
-        id: create_subissues
-        uses: actions/github-script@v7
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const issue = context.issue;
-            const epicTitle = context.payload.issue.title;
-            const body = context.payload.issue.body || '';
-            const parentNumber = issue.number;
-            const subIssues = [];
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Extract Epic Name and Create Sub-Issues
+        id: create-sub-issues
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body || '' }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          # Extract Epic name from title (remove "Epic:" prefix)
+          EPIC_NAME="${ISSUE_TITLE#Epic: }"
+          if [[ "$EPIC_NAME" == "$ISSUE_TITLE" ]]; then
+            EPIC_NAME="${ISSUE_TITLE#"Epic: "}"
+          fi
+          EPIC_NAME="${EPIC_NAME#"epic: "}"
+          EPIC_NAME="${EPIC_NAME#"Epic "}"
+          
+          echo "Epic Name: $EPIC_NAME"
+          
+          # Define task names
+          TASKS=(
+            "Requirements Analysis"
+            "Design and Architecture"
+            "Implementation"
+            "Testing and Documentation"
+          )
+          
+          SUB_ISSUE_COUNTER=1
+          SUB_ISSUES=""
+          FIRST_SUB_ISSUE_NUM=""
+          
+          for TASK_NAME in "${TASKS[@]}"; do
+            # Create sub-issue title
+            SUB_ISSUE_TITLE="[SUBTASK] ${EPIC_NAME} - Task ${SUB_ISSUE_COUNTER}: ${TASK_NAME}"
             
-            const tasks = [
-              { name: 'Requirements Analysis' },
-              { name: 'Design and Architecture' },
-              { name: 'Implementation' },
-              { name: 'Testing and Documentation' }
-            ];
+            # Create sub-issue body
+            SUB_ISSUE_BODY="${ISSUE_BODY}
+
+## Related to #${ISSUE_NUMBER}
+
+### Task Details
+- Subtask: ${TOTAL_TASKS:=4} of ${TOTAL_TASKS} → ${TASK_NAME}
+- Parent Epic: #${ISSUE_NUMBER}
+- Assigned: Not assigned
+- Status: Not started"
+
+            echo "Creating sub-issue: $SUB_ISSUE_TITLE"
             
-            // Create sub-issues with proper title pattern
-            for (let i = 0; i < tasks.length; i++) {
-              const subIssueTitle = `[SUBTASK] ${epicTitle} - Task ${i + 1}: ${tasks[i].name}`;
-              const subIssueBody = `Task from Epic: [${epicTitle}](#${parentNumber})\n\n### Related to #${parentNumber}\n\n> This is a sub-task created automatically from the parent epic issue.\n\n#### Task ${i + 1}: ${tasks[i].name}\n\n- [ ] Requirements Documented\n- [ ] Design Approved\n- [ ] Code Complete\n- [ ] Tests Passing\n- [ ] Documentation Updated`;
+            # Create sub-issue using GitHub API
+            SUB_ISSUE_RESPONSE=$(curl -s -X POST \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${OWNER}/${REPO}/issues" \
+              -d "{
+                \"title\": \"${SUB_ISSUE_TITLE}\",
+                \"body\": \"${SUB_ISSUE_BODY}\",
+                \"labels\": [\"enhancement\", \"needs-review\"],
+                \"assignees\": [],
+                \"milestone\": null
+              }")
+            
+            SUB_ISSUE_URL=$(echo "$SUB_ISSUE_RESPONSE" | jq -r '.html_url')
+            SUB_ISSUE_NUMBER=$(echo "$SUB_ISSUE_RESPONSE" | jq -r '.number')
+            SUB_ISSUE_STATE=$(echo "$SUB_ISSUE_RESPONSE" | jq -r '.state')
+            
+            echo "Created sub-issue: #${SUB_ISSUE_NUMBER} - State: ${SUB_ISSUE_STATE}"
+            
+            # Add reference to parent issue
+            if [ "$SUB_ISSUE_STATE" == "open" ]; then
+              curl -s -X POST \
+                -H "Authorization: token ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${OWNER}/${REPO}/issues/${SUB_ISSUE_NUMBER}/labels" \
+                -d "[\"needs-triage\"]"
               
-              try {
-                const response = await github.rest.issues.create({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  title: subIssueTitle,
-                  body: subIssueBody,
-                  labels: ['enhancement', 'needs-review']
-                });
-                subIssues.push(response.data.number);
-                console.log('Created sub-issue #' + response.data.number + ': ' + subIssueTitle);
-              } catch (error) {
-                console.error('Failed to create sub-issue ' + (i + 1) + ': ' + error.message);
-              }
-            }
+              # Update sub-issue body to include full parent reference
+              curl -s -X PATCH \
+                -H "Authorization: token ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${OWNER}/${REPO}/issues/${SUB_ISSUE_NUMBER}" \
+                -d "{\"body\": \"${SUB_ISSUE_BODY}\\n\\n## Parent Issue\\nRelated to Issue #${ISSUE_NUMBER}\\nStatus: Open\"}"
+            fi
             
-            // Update parent issue body with checklist
-            const taskChecklist = subIssues.map(function(num, index) {
-              return '- [ ] ' + tasks[index].name + ' ([#' + num + '](#' + num + '))';
-            }).join('\n');
+            # Build tracking string for first sub-issue only (for checklist)
+            if [ -z "$FIRST_SUB_ISSUE_NUM" ]; then
+              FIRST_SUB_ISSUE_NUM=${SUB_ISSUE_NUMBER}
+            fi
             
-            const updatedBody = body + '\n\n## Epic Tasks\n\n' + taskChecklist + '\n\n### Sub-issues\n\n- Task 1 (Requirements Analysis): #' + subIssues[0] + '\n- Task 2 (Design and Architecture): #' + subIssues[1] + '\n- Task 3 (Implementation): #' + subIssues[2] + '\n- Task 4 (Testing and Documentation): #' + subIssues[3] + '\n\n---\n_Epic auto-created ' + new Date().toISOString() + '_';
+            # Build tracking string
+            if [ -z "$SUB_ISSUES" ]; then
+              SUB_ISSUES="[#${SUB_ISSUE_NUMBER}](${SUB_ISSUE_URL})"
+            else
+              SUB_ISSUES="${SUB_ISSUES}, [#${SUB_ISSUE_NUMBER}](${SUB_ISSUE_URL})"
+            fi
             
-            await github.rest.issues.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: parentNumber,
-              body: updatedBody
-            });
+            SUB_ISSUE_COUNTER=$((SUB_ISSUE_COUNTER + 1))
+          done
+          
+          echo "sub_issues=${SUB_ISSUES}" >> $GITHUB_OUTPUT
+          echo "sub_issue_numbers=${SUB_ISSUES//\[/\[/}" >> $GITHUB_OUTPUT
+          echo "first_sub_issue=${FIRST_SUB_ISSUE_NUM}" >> $GITHUB_OUTPUT
+          echo "Created sub-issues: ${SUB_ISSUES}"
+
+      - name: Update Parent Issue with Epic Tasks Checklist
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          echo "Updating parent issue #${ISSUE_NUMBER} with epic tasks checklist"
+          
+          # Fetch current issue
+          ISSUE_DATA=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUMBER}")
+          
+          CURRENT_BODY=$(echo "$ISSUE_DATA" | jq -r '.body // "No body"')
+          CURRENT_TITLE=$(echo "$ISSUE_DATA" | jq -r '.title')
+          
+          # Build task checklist
+          TASK_CHECKLIST="- [ ] [Requirements Analysis](https://github.com/${OWNER}/${REPO}/issues/1) - Subtask 1 of 4\n"
+          TASK_CHECKLIST+="- [ ] [Design and Architecture](https://github.com/${OWNER}/${REPO}/issues/2) - Subtask 2 of 4\n"
+          TASK_CHECKLIST+="- [ ] [Implementation](https://github.com/${OWNER}/${REPO}/issues/3) - Subtask 3 of 4\n"
+          TASK_CHECKLIST+="- [ ] [Testing and Documentation](https://github.com/${OWNER}/${REPO}/issues/4) - Subtask 4 of 4"
+          
+          # Add Epic Tasks section to body
+          if [[ "${CURRENT_BODY}" != *"## Epic Tasks"* ]]; then
+            NEW_BODY="${CURRENT_BODY}
+
+## Epic Tasks
+
+${TASK_CHECKLIST}"
             
-            console.log('Updated parent issue #' + parentNumber + ' with checklist');
-            core.setOutput('sub_issues', subIssues.join(','));
-            core.setOutput('sub_issue_count', subIssues.length.toString());
+            # Update issue body
+            curl -s -X PATCH \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUMBER}" \
+              -d "{
+                \"body\": \"${NEW_BODY}\"
+              }"
+            
+            echo "Parent issue body updated with Epic Tasks checklist"
+          else
+            echo "Epic Tasks section already exists, skipping"
+          fi
 
   auto-response:
-    name: Auto Response
+    name: Auto-Response for Issues
     runs-on: ubuntu-latest
-    needs: [issue-triage, task-breakdown]
-    if: github.event.action == 'opened'
+    needs: issue-triage
+    if: always() && github.event.issue.state == 'open'
+    
     steps:
-      - name: Check if first-time contributor
-        id: first_contributor
-        uses: actions/github-script@v7
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const author = context.payload.issue.user.login;
-            
-            try {
-              const result = await github.rest.issues.listForRepo({
-                owner: owner,
-                repo: repo,
-                state: 'all',
-                creator: author,
-                per_page: 1
-              });
-              
-              if (result.data.length === 0) {
-                core.setOutput('is_first_time', 'true');
-                console.log('First-time contributor detected');
-              } else {
-                core.setOutput('is_first_time', 'false');
-                console.log('Not a first-time contributor');
-              }
-            } catch (error) {
-              console.error('Error checking first-time contributor:', error.message);
-              core.setOutput('is_first_time', 'false');
-            }
+          fetch-depth: 1
 
-      - name: Add first-time contributor label and welcome message
-        if: steps.first_contributor.outputs.is_first_time == 'true'
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const issue = context.issue;
-            const author = context.payload.issue.user.login;
-            
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issue.number,
-              labels: ['first-time-contributor']
-            });
-            
-            const welcomeMessage = '⭐ Welcome to the project, ' + author + '!\n\nThanks for your first issue contribution! We are excited to have you here.\n\n## Getting Started\n\n### Bug Report Guidelines\nIf you are reporting a bug, please ensure you have included:\n- Clear description of the issue\n- Steps to reproduce\n- Expected vs actual behavior\n- Relevant log output or screenshots\n\nSee our [Contributing Guide](CONTRIBUTING.md) for more details.\n\n### Feature Request Process\nFor feature requests, please provide:\n- Clear description of the feature\n- Use case and motivation\n- Proposed solution approach (optional)\n\n### Maintenance Guidelines\nFor maintenance tasks:\n- Describe the current state and problem\n- Detail the proposed action\n- Provide any relevant context or impact assessment\n\n## Next Steps\n\nYour issue will be triaged by maintainers shortly. We will review it and get back to you with updates.';
-            
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issue.number,
-              body: welcomeMessage
-            });
-            
-            console.log('Added first-time contributor label and welcome message');
+      - name: Check if first-time contributor (in this repo)
+        id: check-contributor
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          USER: ${{ github.event.issue.user.login }}
+        run: |
+          echo "Checking if ${USER} is a first-time contributor to ${OWNER}/${REPO}"
+          
+          # Fetch issues created by this user
+          ISSUES_DATA=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/issues?creator=${USER}&state=all&per_page=100")
+          
+          ISSUES_COUNT=$(echo "$ISSUES_DATA" | jq '.total_count // 0')
+          
+          echo "Issues created by ${USER}: ${ISSUES_COUNT}"
+          
+          if [ "$ISSUES_COUNT" -eq 0 ]; then
+            echo "is_first_time_contributor=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_first_time_contributor=false" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Post type-specific response and set milestone
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const issue = context.issue;
-            const githubContext = context;
+      - name: Get Issue Labels
+        id: get-labels
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          ISSUE_DATA=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUMBER}")
+          
+          LABELS=$(echo "$ISSUE_DATA" | jq '[.labels[].name] | join(", ")')
+          echo "Current labels: ${LABELS}"
+          echo "labels=${LABELS}" >> $GITHUB_OUTPUT
+
+      - name: Generate Auto-Response Comment
+        id: generate-comment
+        env:
+          HAS_BUG: ${{ needs.issue-triage.outputs.has_bug }}
+          HAS_EPIC: ${{ needs.issue-triage.outputs.has_epic }}
+          HAS_MAINTENANCE: ${{ needs.issue-triage.outputs.has_maintenance }}
+          IS_FIRST_TIME: ${{ steps.check-contributor.outputs.is_first_time_contributor }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          COMMENT_BODY=""
+          
+          # Welcome message for first-time contributors
+          if [ "$IS_FIRST_TIME" == "true" ]; then
+            COMMENT_BODY="### Welcome to ${{ github.event.repository.html_url }}! 👋"
+            COMMENT_BODY+=$'\n\n'
+            COMMENT_BODY+="Thanks for creating your first issue in ${{ github.event.repository.html_url }}. We appreciate your contribution and will do our best to address it promptly."
+            COMMENT_BODY+=$'\n\n'
+            COMMENT_BODY+=$'\n---\n\n'
+          fi
+          
+          # Different responses based on issue type
+          if [ "$HAS_BUG" == "1" ]; then
+            COMMENT_BODY+="### 🐛 Bug Report Guidelines"
+            COMMENT_BODY+=$'\n\n'
+            COMMENT_BODY+="Thank you for reporting this bug! To help us address it quickly, please ensure your bug report includes:"
+            COMMENT_BODY+=$'\n\n'
+            COMMENT_BODY+="1. **Clear description** of the bug and expected behavior"
+            COMMENT_BODY+=$'\n'
+            COMMENT_BODY+="2. **Steps to reproduce** the issue"
+            COMMENT_BODY+=$'\n'
+            COMMENT_BODY+="3. **Expected vs Actual** results"
+            COMMENT_BODY+=$'\n'
+            COMMENT_BODY+="4. **Environment information** (version, OS, etc.)"
+            COMMENT_BODY+=$'\n'
+            COMMENT_BODY+="5. **Error messages** or screenshots"
+            COMMENT_BODY+=$'\n\n'
+            COMMENT_BODY+="You can reference this issue using:\`${ISSUE_NUMBER}\`"
+            COMMENT_BODY+=$'\n\n'
             
-            // Get current labels
-            const issueData = await github.rest.issues.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issue.number
-            });
+            # Change status label
+            if echo "${{ steps.get-labels.outputs.labels }}" | grep -q "\\bneeds-triac\\b"; then
+              curl -s -X POST \
+                -H "Authorization: token ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUMBER}/labels" \
+                -d '["needs-review"]'
+              echo "Updated label from needs-triage to needs-review for bug issue"
+            fi
             
-            const labels = issueData.data.labels.map(function(l) { return l.name; });
-            const isBug = labels.indexOf('bug') !== -1;
-            const isEpic = labels.indexOf('epic') !== -1;
-            const isMaintenance = labels.indexOf('maintenance') !== -1;
+          elif [ "$HAS_EPIC" == "1" ]; then
+            COMMENT_BODY+="### ✨ Feature Request Process"
+            COMMENT_BODY+=$'\n\n'
+            COMMENT_BODY+="Thank you for suggesting this epic! This large-scale feature has been registered and will be broken down into subtasks."
+            COMMENT_BODY+=$'\n\n'
+            COMMENT_BODY+="**Epic Overview:**"
+            COMMENT_BODY+=$'\n'
+            COMMENT_BODY+="* **Issue #:** ${ISSUE_NUMBER}"
+            COMMENT_BODY+=$'\n'
+            COMMENT_BODY+="* **Status:** Awaiting breakdown"
+            COMMENT_BODY+=$'\n'
+            COMMENT_BODY+="* **Assignee:** Not assigned"
+            COMMENT_BODY+=$'\n\n'
+            COMMENT_BODY+="**Next Steps:**"
+            COMMENT_BODY+=$'\n'
+            COMMENT_BODY+="* This epic will be divided into 4 sub-tasks:"
+            COMMENT_BODY+=$'\n'
+            COMMENT_BODY+="  1. Requirements Analysis"
+            COMMENT_BODY+=$'\n'
+            COMMENT_BODY+="  2. Design and Architecture"
+            COMMENT_BODY+=$'\n'
+            COMMENT_BODY+="  3. Implementation"
+            COMMENT_BODY+=$'\n'
+            COMMENT_BODY+="  4. Testing and Documentation"
+            COMMENT_BODY+=$'\n\n'
+            COMMENT_BODY+="Please stay tuned for updates as sub-issues are created. You can follow the progress using:\`${ISSUE_NUMBER}\`"
+            COMMENT_BODY+=$'\n\n'
             
-            let responseMessage = '';
+            # Change status label
+            if echo "${{ steps.get-labels.outputs.labels }}" | grep -q "\\bneeds-triac\\b"; then
+              curl -s -X POST \
+                -H "Authorization: token ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUMBER}/labels" \
+                -d '["needs-review"]'
+              echo "Updated label from needs-triage to needs-review for epic issue"
+            fi
             
-            if (isBug) {
-              responseMessage = '🐛 Thanks for reporting this bug!\n\n### Bug Report Guidelines\nPlease check the following before we begin investigating:\n- [ ] You have checked for existing issues\n- [ ] You have provided clear steps to reproduce\n- [ ] You have specified expected behavior\n- [ ] You have provided any relevant logs or error messages\n\nOur maintainers will review this issue and update you with progress. See our [Bug Triage Process](CONTRIBUTING.md#bug-reports) for details.';
-            } else if (isEpic) {
-              responseMessage = '🎨 Thanks for submitting this feature request!\n\n### Feature Request Process\nThis epic will be broken down into actionable sub-tasks. Our maintainers will:\n1. Add the milestone "v1.0.0" if this is marked as high priority\n2. Create 4 sub-tasks for the epic (Requirements Analysis, Design, Implementation, Testing)\n3. Link first-time contributors for a warm welcome\n\nOur maintainers will review this epic and update you with the sub-task breakdown. See our [Feature Request Process](CONTRIBUTING.md#feature-requests) for details.';
-            } else if (isMaintenance) {
-              responseMessage = '🔧 Thanks for submitting a maintenance task!\n\n### Maintenance Guidelines\nPlease ensure your request includes:\n- Clear description of the current state\n- Proposed action or fix\n- Impact assessment\n- Any relevant technical context\n\nOur maintainers will review this request and add it to the appropriate sprint if deemed valuable. See our [Maintenance Guidelines](CONTRIBUTING.md#maintenance) for details.';
-            } else {
-              responseMessage = '📮 Thanks for submitting an issue!\n\nYour issue has been triaged and assigned the following labels:\n- ' + labels.map(function(l) { return '* ' + l; }).join('\n') + '\n\nPlease update the issue with any additional details that might help us investigate.\n\nRemember to check for existing issues before creating new ones. See our [Contributing Guide](CONTRIBUTING.md) for full details.';
-            }
+          elif [ "$HAS_MAINTENANCE" == "1" ]; then
+            COMMENT_BODY+="### 🧹 Maintenance Guidelines"
+            COMMENT_BODY+=$'\n\n'
+            COMMENT_BODY+="Thank you for reporting this maintenance task. Our team will review and add it to our maintenance backlog."
+            COMMENT_BODY+=$'\n\n'
+            COMMENT_BODY+="**Maintenance Request:**"
+            COMMENT_BODY+=$'\n'
+            COMMENT_BODY+="* **Issue #:** ${ISSUE_NUMBER}"
+            COMMENT_BODY+=$'\n'
+            COMMENT_BODY+="* **Status:** Awaiting review"
+            COMMENT_BODY+=$'\n'
+            COMMENT_BODY+="* **Priority:** Based on the current priority label"
+            COMMENT_BODY+=$'\n\n'
+            COMMENT_BODY+="Please ensure your report includes relevant details about the maintenance work needed."
+            COMMENT_BODY+=$'\n\n'
+            COMMENT_BODY+="You can reference this issue using:\`${ISSUE_NUMBER}\`"
+            COMMENT_BODY+=$'\n\n'
             
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issue.number,
-              body: responseMessage
-            });
+            # Change status label for maintenance issues as well
+            if echo "${{ steps.get-labels.outputs.labels }}" | grep -q "\\bneeds-triac\\b"; then
+              curl -s -X POST \
+                -H "Authorization: token ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUMBER}/labels" \
+                -d '["needs-review"]'
+              echo "Updated label from needs-triage to needs-review for maintenance issue"
+            fi
             
-            console.log('Posted type-specific response');
+          else
+            COMMENT_BODY+="### 📋 General Issue Response"
+            COMMENT_BODY+=$'\n\n'
+            COMMENT_BODY+="Thank you for creating this issue. We've added appropriate labels for classification."
+            COMMENT_BODY+=$'\n\n'
+            COMMENT_BODY+="**Issue:** ${ISSUE_NUMBER}"
+            COMMENT_BODY+=$'\n'
+            COMMENT_BODY+="**Status:** Awaiting review"
+            COMMENT_BODY+=$'\n\n'
+            COMMENT_BODY+="Please provide any additional details that might help us address your issue."
+            COMMENT_BODY+=$'\n\n'
             
-            // Set milestone for high-priority issues
-            const priorityLabels = ['priority-critical', 'priority-high'];
-            const hasPriority = priorityLabels.some(function(label) { return labels.indexOf(label) !== -1; });
-            
-            if (hasPriority) {
-              try {
-                await github.rest.issues.update({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: issue.number,
-                  milestone: 'v1.0.0'
-                });
-                console.log('Set milestone to v1.0.0 for high-priority issue');
-              } catch (error) {
-                console.error('Failed to set milestone:', error.message);
-              }
-            }
-            
-            // Update needs-triage to needs-review after response
-            try {
-              const currentLabels = labels.filter(function(l) { return l !== 'needs-triage'; });
-              await github.rest.issues.setLabels({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issue.number,
-                labels: currentLabels
-              });
-              console.log('Updated label from needs-triage to needs-review');
-            } catch (error) {
-              console.error('Failed to update labels:', error.message);
-            }
+            # Change status label for all non-epic issues
+            if echo "${{ steps.get-labels.outputs.labels }}" | grep -q "\\bneeds-triac\\b"; then
+              curl -s -X POST \
+                -H "Authorization: token ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUMBER}/labels" \
+                -d '["needs-review"]'
+              echo "Updated label from needs-triage to needs-review for general issue"
+            fi
+          fi
+          
+          # Add first-time contributor label
+          if [ "$IS_FIRST_TIME" == "true" ]; then
+            curl -s -X POST \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUMBER}/labels" \
+              -d '["first-time-contributor"]'
+            echo "Added first-time-contributor label"
+          fi
+          
+          # Escape newlines and special characters for the comment body
+          COMMENT_BODY_ESCAPED=$(printf '%s' "$COMMENT_BODY" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+          
+          echo "Generated comment body"
+          echo "$COMMENT_BODY" | head -20
+          
+          echo "comment_body=${COMMENT_BODY}" >> $GITHUB_OUTPUT
+
+      - name: Post Auto-Response Comment
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          COMMENT_BODY="${{ steps.generate-comment.outputs.comment_body }}"
+          COMMENT_BODY=$(printf '%s' "$COMMENT_BODY" | sed 's/\\/\\\\/g; s/"/\\"/g; s/`/\\`/g')
+          
+          curl -s -X POST \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+            -d "{\"body\": \"${COMMENT_BODY}\"}"
+          
+          echo "Auto-response comment posted to issue #${ISSUE_NUMBER}"
+
+  set-milestone:
+    name: Set Milestone for High Priority Issues
+    runs-on: ubuntu-latest
+    needs: [issue-triage, auto-response]
+    if: |
+      github.event.issue.state == 'open' && 
+      needs.auto-response.outputs.status == 'success' &&
+      (needs.issue-triage.outputs.priority == 'priority-critical' || needs.issue-triage.outputs.priority == 'priority-high')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set Milestone to v1.0.0
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          echo "Setting milestone v1.0.0 for issue #${ISSUE_NUMBER}"
+          
+          # First, find the milestone number for v1.0.0
+          MILESTONE_DATA=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/milestones?state=open&per_page=100")
+          
+          MILESTONE_NUMBER=$(echo "$MILESTONE_DATA" | jq -r '.[] | select(.title == "v1.0.0") | .number // empty')
+          
+          if [ -n "$MILESTONE_NUMBER" ]; then
+            curl -s -X PATCH \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUMBER}" \
+              -d "{
+                \"milestone\": ${MILESTONE_NUMBER}
+              }"
+            echo "Milestone v1.0.0 (ID: ${MILESTONE_NUMBER}) added to issue #${ISSUE_NUMBER}"
+          else
+            echo "Milestone v1.0.0 not found, skipping milestone assignment"
+          fi
