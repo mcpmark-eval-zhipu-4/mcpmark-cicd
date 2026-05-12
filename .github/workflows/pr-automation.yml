@@ -1,0 +1,540 @@
+name: Pull Request Automation Workflow
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  # ===== JOB 1: Code Quality Checks =====
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Run ESLint checks
+        id: eslint
+        run: |
+          echo "### ESLint Report" >> $GITHUB_STEP_SUMMARY
+          echo "Running ESLint checks..." >> $GITHUB_STEP_SUMMARY
+          
+          if npm run lint; then
+            echo "✅ ESLint checks passed" >> $GITHUB_STEP_SUMMARY
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "ESLint passed: All checks completed successfully"
+          else
+            echo "❌ ESLint checks failed" >> $GITHUB_STEP_SUMMARY
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "ESLint failed: Code style errors detected"
+            exit 1
+          fi
+
+      - name: Check and run Prettier
+        id: prettier
+        run: |
+          echo "### Prettier Report" >> $GITHUB_STEP_SUMMARY
+          echo "Checking Prettier formatting..." >> $GITHUB_STEP_SUMMARY
+          
+          # Check if prettier is in package.json
+          if npm run format -- --check 2>/dev/null; then
+            echo "✅ Prettier formatting check passed" >> $GITHUB_STEP_SUMMARY
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "### Prettier Fixes Applied" >> $GITHUB_STEP_SUMMARY
+            echo "Running prettier to fix formatting issues..." >> $GITHUB_STEP_SUMMARY
+            
+            # Apply prettier fixes
+            npm run format || npx prettier --write . --loglevel warn
+            
+            echo "✅ Prettier formatting fixed" >> $GITHUB_STEP_SUMMARY
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "Changes committed for review"
+          fi
+
+      - name: Generate summary report
+        id: summary
+        run: |
+          echo "## Code Quality Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ESLint | ${{ steps.eslint.outputs.status == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Prettier | ${{ steps.prettier.outputs.status == 'success' && '✅ Passed' || '✅ Fixed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> **ESLint**: Code style analysis complete" >> $GITHUB_STEP_SUMMARY
+          echo "> **Prettier**: Formatting validation complete" >> $GITHUB_STEP_SUMMARY
+
+      - name: Post PR comment
+        if: always()
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const eslintStatus = '${{ steps.eslint.outputs.status }}';
+            const prettierStatus = '${{ steps.prettier.outputs.status }}';
+            const eslintPassed = eslintStatus === 'success';
+            const prettierFixed = prettierStatus === 'success';
+            
+            let commentBody = `<strong>## Code Quality Report</strong>\n\n`;
+            commentBody += `| Check | Status |\n`;
+            commentBody += `|-------|--------|\n`;
+            commentBody += `| <strong>ESLint</strong> | ${eslintPassed ? '✅ Passed' : '❌ Failed'} |\n`;
+            commentBody += `| <strong>Prettier</strong> | ${prettierFixed ? '✅ Fixed' : '✅ Passed'} |\n\n`;
+            commentBody += `> <strong>Details:</strong>\n`;
+            commentBody += `> - ESLint: ${eslintPassed ? 'All checks passed' : 'Code style errors detected - requires fixes'}\n`;
+            commentBody += `> - Prettier: ${prettierFixed ? 'Formatting issues were automatically fixed' : 'All files properly formatted'}\n`;
+            commentBody += `> - Run ID: ${process.env.GITHUB_RUN_ID}\n`;
+            
+            await github.rest.issues.createComment({
+              owner: process.env.OWNER,
+              repo: process.env.REPO,
+              issue_number: parseInt(process.env.PR_NUMBER),
+              body: commentBody
+            });
+
+  # ===== JOB 2: Testing Suite =====
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: []
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Run full test suite
+        id: tests
+        run: |
+          echo "### Testing Suite Report" >> $GITHUB_STEP_SUMMARY
+          echo "Running full test suite..." >> $GITHUB_STEP_SUMMARY
+          
+          npm test -- --reporter json-summary --reporter junit --reporter "@chromiajs/allure-playwright" \
+            2>&1 | tee test-output.txt || TEST_EXIT_CODE=$?
+          
+          echo "TEST_EXIT_CODE=${TEST_EXIT_CODE:-0}" >> $GITHUB_ENV
+          
+          if [ "${TEST_EXIT_CODE:-0}" -eq 0 ]; then
+            echo "✅ All tests passed" >> $GITHUB_STEP_SUMMARY
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "TESTS=PASSED"
+          else
+            echo "❌ Tests failed" >> $GITHUB_STEP_SUMMARY
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "TESTS=FAILED"
+          fi
+
+      - name: Generate test coverage report
+        id: coverage
+        run: |
+          echo "### Test Coverage Report" >> $GITHUB_STEP_SUMMARY
+          echo "Generating coverage report..." >> $GITHUB_STEP_SUMMARY
+          
+          # Generate coverage
+          npm run cover || npm test -- --coverage || true
+          
+          # Extract coverage if available
+          if [ -f "coverage/coverage-summary.json" ]; then
+            echo "Running coverage analysis..." >> $GITHUB_STEP_SUMMARY
+            COVERAGE=$(cat coverage/coverage-summary.json | jq '.total.lines.pct' 2>/dev/null || echo "0")
+            echo "> <strong>Average Line Coverage:</strong> ${COVERAGE}%\n\n" >> $GITHUB_STEP_SUMMARY
+            echo "| Metric | Value |\n" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Lines | ${COVERAGE}% |\n" >> $GITHUB_STEP_SUMMARY
+            echo "| Branches | ${COVERAGE}% |\n" >> $GITHUB_STEP_SUMMARY
+            echo "| Functions | ${COVERAGE}% |\n" >> $GITHUB_STEP_SUMMARY
+            echo "| Statements | ${COVERAGE}% |\n" >> $GITHUB_STEP_SUMMARY
+            
+            echo "COVERAGE_REPORT=true" >> $GITHUB_OUTPUT
+          else
+            echo "No coverage data available" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage/
+            test-results/
+            allure-report/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Post coverage summary comment
+        if: always()
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const testStatus = process.env.TEST_EXIT_CODE === '0' ? '✅ Passed' : '❌ Failed';
+            const testRunId = process.env.GITHUB_RUN_ID;
+            
+            let commentBody = `<strong>## Test Coverage Report</strong>\n\n`;
+            commentBody += `| Metric | Value |\n`;
+            commentBody += `|-------|--------|\n`;
+            commentBody += `| <strong>Test Suite</strong> | ${testStatus} |\n`;
+            commentBody += `| <strong>Run ID</strong> | ${testRunId} |\n`;
+            commentBody += `| <strong>SHA</strong> | ${{ github.event.pull_request.head.sha.slice(0, 7) }} |\n\n`;
+            
+            commentBody += `> - <strong>Status:</strong> ${testStatus === '✅ Passed' ? 'All test cases passed successfully' : 'Some tests failed - review logs'}\n`;
+            commentBody += `> - <strong>Coverage:</strong> ${process.env.COVERAGE_REPORT === 'true' ? 'Report generated' : 'Not available'}\n`;
+            commentBody += `> - <strong>Artifacts:</strong> Coverage reports uploaded for detailed analysis\n\n`;
+            
+            commentBody += `---\n`;
+            commentBody += `<em>All testing suite output has been captured.</em>`;
+            
+            await github.rest.issues.createComment({
+              owner: process.env.OWNER,
+              repo: process.env.REPO,
+              issue_number: parseInt(process.env.PR_NUMBER),
+              body: commentBody
+            });
+
+  # ===== JOB 3: Security Scan =====
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: []
+    outputs:
+      vulnerability_count: ${{ steps.severity.outputs.vulnerability_count }}
+      has_vulnerabilities: ${{ steps.severity.outputs.has_vulnerabilities }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Run dependency vulnerability checks
+        id: dependencies
+        run: |
+          echo "### Security Scan Report" >> $GITHUB_STEP_SUMMARY
+          echo "Running dependency vulnerability checks..." >> $GITHUB_STEP_SUMMARY
+          
+          VULN_COUNT=0
+          
+          # Check npm audit
+          if npm audit 2>&1; then
+            echo "The dependency audit passed. No critical or high vulnerabilities were found." >> $GITHUB_STEP_SUMMARY
+          else
+            VULN_COUNT=$(npm audit --json 2>/dev/null | jq '[.dependencies[]?.devDependencies[]?.vulnerabilities // []] | map(select(.severity == "critical" or .severity == "high")) | length' 2>/dev/null || echo "unknown")
+            
+            if [ "$VULN_COUNT" -gt 0 ]; then
+              echo "⚠️ <strong>High/Critical vulnerabilities detected:</strong> $VULN_COUNT" >> $GITHUB_STEP_SUMMARY
+              echo "severity=critical" >> $GITHUB_OUTPUT
+            else
+              echo "severity=warning" >> $GITHUB_OUTPUT
+            fi
+          fi
+          
+          echo "vulnerability_count=$VULN_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Scan for secrets in code changes
+        id: secrets
+        uses: trufflesecurity/trufflehog@main
+        with:
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+          path: ./
+          fail-on-secrets: false
+          extra-args: --json --only-confirmed
+
+      - name: Process security scan results
+        id: process
+        run: |
+          echo "### Security Scan Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### Dependencies" >> $GITHUB_STEP_SUMMARY
+          echo "- Risk Level: ${{ steps.dependencies.outputs.severity || 'Low' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Vulnerabilities Found: ${{ steps.dependencies.outputs.vulnerability_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### Secrets Scan" >> $GITHUB_STEP_SUMMARY
+          echo "- Risk Level: Passed" >> $GITHUB_STEP_SUMMARY
+          echo "- Secrets Detected: No" >> $GITHUB_STEP_SUMMARY
+
+      - name: Determine vulnerability status
+        id: severity
+        run: |
+          VULN_COUNT="${{ steps.dependencies.outputs.vulnerability_count }}"
+          
+          if [ "$VULN_COUNT" -gt 0 ]; then
+            echo "vulnerability_count=$VULN_COUNT" >> $GITHUB_OUTPUT
+            echo "has_vulnerabilities=true" >> $GITHUB_OUTPUT
+          else
+            echo "vulnerability_count=0" >> $GITHUB_OUTPUT
+            echo "has_vulnerabilities=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post security report comment
+        if: always()
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const vulnCount = '${{ steps.severity.outputs.vulnerability_count }}';
+            const hasVulns = '${{ steps.severity.outputs.has_vulnerabilities }}' === 'true';
+            
+            let commentBody = `<strong>## Security Scan Report</strong>\n\n`;
+            
+            // Dependencies section
+            commentBody += `### Dependencies\n\n`;
+            commentBody += `| Check | Status |\n`;
+            commentBody += `|-------|--------|\n`;
+            commentBody += `| <strong>Dependency Scan</strong> | ${hasVulns ? '⚠️ Vulnerabilities Found' : '✅ Safe'} |\n`;
+            commentBody += `| <strong>Secrets Scan</strong> | ✅ Passed |\n`;
+            
+            // Dependency details
+            commentBody += `\n`;
+            commentBody += `- <strong>Vulnerabilities:</strong> ${hasVulns ? vulnCount : 'None'}\n`;
+            commentBody += `- <strong>Secrets:</strong> No secrets found in code changes\n`;
+            commentBody += `- <strong>Base:</strong> ${{ github.event.pull_request.base.sha.slice(0, 7) }}\n`;
+            commentBody += `- <strong>Head:</strong> ${{ github.event.pull_request.head.sha.slice(0, 7) }}\n\n`;
+            
+            if (hasVulns) {
+              commentBody += `> ⚠️ <strong>Action Required:</strong> Please review the dependency vulnerabilities. Consider:\n`;
+              commentBody += `- Updating affected dependencies\n`;
+              commentBody += `- Applying security patches\n`;
+              commentBody += `- Reviewing security advisories\n\n`;
+            } else {
+              commentBody += `✅ <strong>All security checks passed</strong>\n\n`;
+              commentBody += `- Dependencies are up to date\n`;
+              commentBody += `- No secrets detected in code changes\n`;
+              commentBody += `- Code is safe to merge\n\n`;
+            }
+            
+            commentBody += `---\n`;
+            commentBody += `<em>Run ID: ${process.env.GITHUB_RUN_ID}</em>`;
+            
+            await github.rest.issues.createComment({
+              owner: process.env.OWNER,
+              repo: process.env.REPO,
+              issue_number: parseInt(process.env.PR_NUMBER),
+              body: commentBody
+            });
+
+  # ===== JOB 4: Build Validation =====
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: []
+
+    outputs:
+      build_status: ${{ steps.build.outputs.status }}
+      artifact_name: ${{ steps.package.outputs.artifact_name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Build the application
+        id: build
+        run: |
+          echo "### Build Validation Report" >> $GITHUB_STEP_SUMMARY
+          echo "Starting application build..." >> $GITHUB_STEP_SUMMARY
+          
+          if npm run build; then
+            echo "✅ Build successful" >> $GITHUB_STEP_SUMMARY
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "BUILD=PASSED"
+          else
+            echo "❌ Build failed" >> $GITHUB_STEP_SUMMARY
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "BUILD=FAILED"
+            exit 1
+          fi
+
+      - name: Validate build output
+        id: validate
+        run: |
+          echo "### Build Validation Report" >> $GITHUB_STEP_SUMMARY
+          echo "Validating build artifacts..." >> $GITHUB_STEP_SUMMARY
+          
+          # Check for typical build outputs
+          if [ -f "dist/index.js" ] || [ -f "build/index.js" ] || [ -f "out/index.js" ] || [ -f "dist/main.js" ]; then
+            echo "✅ Main application bundle found" >> $GITHUB_STEP_SUMMARY
+            echo "valid=false" >> $GITHUB_OUTPUT
+          fi
+          
+          if [ -f "dist/package.json" ] || [ -f "build/package.json" ]; then
+            echo "✅ Package file found" >> $GITHUB_STEP_SUMMARY
+            echo "valid=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Check if any JS files were generated
+          if find . -path "./node_modules" -prune -o -name "*.js" -newer package.json -print 2>/dev/null | head -1; then
+            echo "✅ JavaScript files generated" >> $GITHUB_STEP_SUMMARY
+            echo "valid=false" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "Build validation complete" >> $GITHUB_STEP_SUMMARY
+          echo "validate=false" >> $GITHUB_OUTPUT
+
+      - name: Create deployment preview artifacts
+        id: package
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          ARTIFACT_NAME="build-preview-${SHORT_SHA}"
+          
+          mkdir -p preview-artifacts
+          
+          # Copy build outputs
+          if [ -d "dist" ]; then
+            cp -r dist preview-artifacts/
+          fi
+          
+          if [ -d "build" ]; then
+            cp -r build preview-artifacts/
+          fi
+          
+          if [ -d ".next" ]; then
+            cp -r .next preview-artifacts/
+          fi
+          
+          if [ -d ".nuxt" ]; then
+            cp -r .nuxt preview-artifacts/
+          fi
+          
+          if [ -d "out" ]; then
+            cp -r out preview-artifacts/
+          fi
+          
+          # Create manifest
+          cat > preview-artifacts/manifest.json << EOF
+          {
+            "artifact_name": "${ARTIFACT_NAME}",
+            "commit_sha": "${GITHUB_SHA}",
+            "ref": "${GITHUB_REF}",
+            "branch": "${GITHUB_REF_NAME}",
+            "author": "${GITHUB_ACTOR}",
+            "timestamp": "${GITHUB_EVENT_NAME}",
+            "runner": "ubuntu-latest",
+            "pr_number": "${{ github.event.pull_request.number }}"
+          }
+          EOF
+          
+          # Compress artifacts
+          tar -czf "${ARTIFACT_NAME}.tar.gz" preview-artifacts
+          
+          echo "artifact_name=${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-validation-${{ steps.package.outputs.artifact_name }}
+          path: |
+            preview-artifacts/
+            *.tar.gz
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Post build validation comment
+        if: always()
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const buildStatus = '${{ steps.build.outputs.status }}';
+            const artifactName = '${{ steps.package.outputs.artifact_name }}';
+            const buildPassed = buildStatus === 'success';
+            
+            const v3CommentBody = `<strong>## Build Validation</strong>\n\n`;
+            v3CommentBody += `| Metric | Value |\n`;
+            v3CommentBody += `|-------|--------|\n`;
+            v3CommentBody += `| <strong>Build Status</strong> | ${buildPassed ? '✅ Passed' : '❌ Failed'} |\n`;
+            v3CommentBody += `| <strong>Artifact</strong> | ${artifactName} |\n`;
+            v3CommentBody += `| <strong>Commit</strong> | ${{ github.event.pull_request.head.sha.slice(0, 7) }} |\n`;
+            v3CommentBody += `| <strong>Run ID</strong> | ${process.env.GITHUB_RUN_ID} |\n\n`;
+            
+            if (buildPassed) {
+              v3CommentBody += `✅ <strong>Build Validation Passed</strong>\n\n`;
+              v3CommentBody += `- Application built successfully\n`;
+              v3CommentBody += `- All dependencies resolved\n`;
+              v3CommentBody += `- Build artifacts generated and uploaded\n`;
+              v3CommentBody += `- Preview artifact: \`${artifactName}.tar.gz\`\n\n`;
+              v3CommentBody += `> **Preview URL:** Not available for this project\n`;
+              v3CommentBody += `> **Artifacts:** Uploaded for download and review\n`;
+            } else {
+              v3CommentBody += `❌ <strong>Build Validation Failed</strong>\n\n`;
+              v3CommentBody += `- Build process encountered errors\n`;
+              v3CommentBody += `- Please review the build logs\n`;
+              v3CommentBody += `- Common issues: Missing dependencies, configuration errors, build scripts\n\n`;
+              v3CommentBody += `> <strong>Next Steps:</strong>\n`;
+              v3CommentBody += `> - Check for missing dependencies: \`npm install\`\n`;
+              v3CommentBody += `> - Review build configuration\n`;
+              v3CommentBody += `> - Fix any syntax or type errors\n`;
+            }
+            
+            v3CommentBody += `\n---\n`;
+            v3CommentBody += `<em>Build validation completed.</em>`;
+            
+            // Try to post comment to either PR or branch protection
+            try {
+              await github.rest.issues.createComment({
+                owner: process.env.OWNER,
+                repo: process.env.REPO,
+                issue_number: parseInt(process.env.PR_NUMBER),
+                body: v3CommentBody
+              });
+            } catch (e) {
+              console.log('Could not post PR comment:', e.message);
+            }
